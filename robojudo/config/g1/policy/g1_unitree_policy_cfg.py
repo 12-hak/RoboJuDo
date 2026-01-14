@@ -124,3 +124,14 @@ class G1UnitreeWoGaitPolicyCfg(UnitreeWoGaitPolicyCfg):
         "dof_vel": obs_dof.num_dofs,
         "actions": action_dof.num_dofs,
     }
+    
+    # Fix turning: increase range for better turning response
+    # Original was [1.0, 0.0, -1.0] which may have been too weak or inverted
+    commands_map: list[list[float]] = [
+        [-1.0, 0.0, 1.0],  # forward/backward (ly)
+        [1.0, 0.0, -1.0],  # left/right (lx)
+        [-2.0, 0.0, 2.0],  # turning (rx) - increased range for stronger turning in both directions
+    ]
+    
+    # Increase max turning command for better responsiveness
+    max_cmd: list[float] = [0.8, 0.5, 2.0]  # Increased from 1.57 to 2.0 for turning

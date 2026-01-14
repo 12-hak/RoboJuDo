@@ -34,9 +34,14 @@ class Policy(ABC):
             # self.model: torch.nn.Module | None = None # type: ignore
             pass
         else:
-            policy_file = self.cfg_policy.policy_file
-            logger.debug(f"Loading jit from {policy_file}...")
-            self.model = torch.jit.load(policy_file, map_location=self.device)
+            # Check if model was preloaded at script start (for faster loading)
+            if hasattr(self.cfg_policy, '_preloaded_session') and self.cfg_policy._preloaded_session is not None:
+                logger.info(f"Using preloaded TorchScript model (fast loading)")
+                self.model = self.cfg_policy._preloaded_session
+            else:
+                policy_file = self.cfg_policy.policy_file
+                logger.debug(f"Loading jit from {policy_file}...")
+                self.model = torch.jit.load(policy_file, map_location=self.device)
 
         self.action_scale = self.cfg_policy.action_scale
         self.action_clip = self.cfg_policy.action_clip

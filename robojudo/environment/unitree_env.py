@@ -6,6 +6,7 @@ from scipy.spatial.transform import Rotation as sRot
 
 # Unitree SDK
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber  # type: ignore
+from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient  # type: ignore
 from unitree_sdk2py.idl.default import (  # type: ignore
     unitree_go_msg_dds__LowCmd_,
     unitree_go_msg_dds__LowState_,
@@ -49,6 +50,27 @@ class UnitreeEnv(Environment):
         super().__init__(cfg_env=cfg_env, device=device)
 
         ChannelFactoryInitialize(0, self.cfg_env.unitree.net_if)
+
+        # MotionSwitcherClient for mode management (like C++ SDK)
+        self.msc = MotionSwitcherClient()
+        self.msc.SetTimeout(5.0)
+        self.msc.Init()
+        
+        # Track if we're in prepare mode (sport mode active, don't send low-level commands)
+        self._in_prepare_mode = self.cfg_env.unitree.delay_mode_release
+        
+        # Only release mode if delay_mode_release is False
+        if not self._in_prepare_mode:
+            logger.info("Releasing sport mode immediately...")
+            code, result = self.msc.CheckMode()
+            if code == 0 and result and result.get('name'):
+                while result and result.get('name'):
+                    self.msc.ReleaseMode()
+                    time.sleep(1)
+                    code, result = self.msc.CheckMode()
+                logger.info("Motion control service shutdown successfully.")
+        else:
+            logger.info("Mode release delayed - robot will stay in sport mode until release_mode() is called.")
 
         self.RemoteControllerHandler = None
         self.robot = self.cfg_env.unitree.robot
@@ -285,6 +307,12 @@ class UnitreeEnv(Environment):
     def step(self, pd_target, hand_pose=None):
         assert len(pd_target) == self.num_dofs, "pd_target len should be num_dofs of env"
 
+        # If in prepare mode (sport mode active), don't send low-level commands
+        # Let sport mode handle the robot until prepare completes
+        if self._in_prepare_mode:
+            # Just update state, don't send commands
+            return
+
         # limits = self.position_limits
         # pd_target_clipped = np.clip(pd_target, limits[:, 0], limits[:, 1])
 
@@ -302,9 +330,88 @@ class UnitreeEnv(Environment):
 
         self.control_joints(positions, hand_pose)
 
+    def release_mode(self):
+        """Release sport mode (call after prepare to switch from R2+A to R1+Y)"""
+        if self._in_prepare_mode:
+            logger.info("Releasing sport mode - switching to developer mode...")
+            code, result = self.msc.CheckMode()
+            if code == 0 and result and result.get('name'):
+                while result and result.get('name'):
+                    code_release, _ = self.msc.ReleaseMode()
+                    if code_release == 0:
+                        logger.info("Sport mode released successfully")
+                    else:
+                        logger.warning(f"ReleaseMode returned code: {code_release}")
+                    time.sleep(1)
+                    code, result = self.msc.CheckMode()
+                logger.info("Motion control service shutdown successfully (delayed release).")
+            else:
+                logger.info("No active sport mode to release.")
+            self._in_prepare_mode = False
+        else:
+            logger.info("Not in prepare mode, sport mode already released.")
+
+    def select_sport_mode(self, mode_name="ai"):
+        """Return to sport mode (switch from R1+Y to R2+A)
+        
+        Args:
+            mode_name: Sport mode name to select. Common values:
+                - "ai" (most common for G1 sport mode)
+                - "SportAI"
+                - "normal"
+        """
+        logger.info(f"Selecting sport mode: '{mode_name}'...")
+        code, result = self.msc.CheckMode()
+        if code == 0 and result:
+            name = result.get('name', '')
+            logger.info(f"Current mode before switch: '{name if name else '(none - developer mode)'}'")
+        
+        code_select, _ = self.msc.SelectMode(mode_name)
+        if code_select == 0:
+            logger.info(f"SelectMode('{mode_name}') returned success")
+            time.sleep(1)  # Give it a moment to switch
+            
+            # Verify it worked
+            code_check, result_check = self.msc.CheckMode()
+            if code_check == 0 and result_check:
+                name_new = result_check.get('name', '')
+                if name_new:
+                    logger.info(f"✓ Switched to sport mode: {name_new} - robot now in sport mode")
+                    self._in_prepare_mode = True
+                else:
+                    logger.warning("Mode name is empty - might still be in developer mode")
+        else:
+            logger.warning(f"SelectMode('{mode_name}') failed with code: {code_select}")
+
+    def check_mode(self):
+        """Check current robot mode
+        
+        Returns:
+            tuple: (form, name) where form is the mode form and name is the mode name
+                   (name will be empty string if in developer mode)
+        """
+        code, result = self.msc.CheckMode()
+        if code == 0 and result:
+            return result.get('form', 'None'), result.get('name', '')
+        return 'None', ''
+
     def shutdown(self):
-        self.set_damping_mode()
+        """Shutdown: disable all controls and apply dampening only to prevent vibration"""
+        logger.info("Shutting down: disabling controls and applying dampening...")
+        
+        # Immediately disable command sending to prevent any new commands
         self.enabled = False
+        
+        # Set motors to dampening mode only (no position/torque control)
+        # This prevents vibration by removing all control inputs, keeping only damping
+        self.set_damping_mode()
+        
+        # Send damping command multiple times to ensure it's applied
+        for _ in range(3):
+            self.send_cmd(self.low_cmd)
+            time.sleep(0.05)  # Brief delay between commands
+        
+        logger.info("✓ Shutdown complete: motors in dampening mode only")
 
     def set_zero_torque_mode(self):
         create_zero_cmd(self.low_cmd)

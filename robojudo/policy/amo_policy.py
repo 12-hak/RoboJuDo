@@ -1,4 +1,5 @@
 from collections import deque
+import logging
 
 import numpy as np
 import torch
@@ -6,6 +7,8 @@ import torch
 from robojudo.policy import Policy, policy_registry
 from robojudo.policy.policy_cfgs import AMOPolicyCfg
 from robojudo.utils.util_func import command_remap, quatToEuler
+
+logger = logging.getLogger(__name__)
 
 
 @policy_registry.register
@@ -63,7 +66,12 @@ class AMOPolicy(Policy):
             self.extra_history_buf.append(np.zeros(self.n_proprio))
 
         self.cmd = np.zeros(8, dtype=np.float32)
-        self.cmd[0:4] = [map[1] for map in self.commands_map]
+        # Initialize commands from commands_map (first 4: vel_y, ang_z, vel_x, height)
+        if len(self.commands_map) >= 4:
+            self.cmd[0:4] = [map[1] for map in self.commands_map[0:4]]
+        
+        # Height command initialization (default is middle of commands_map[3] range)
+        self.height_command = self.commands_map[3][1] if len(self.commands_map) > 3 else 0.75  # Default to middle value
 
         self.adapter = torch.jit.load(self.cfg_policy.policy_adapter_file, map_location=self.device)
         self.adapter.eval()
@@ -83,6 +91,11 @@ class AMOPolicy(Policy):
 
     def reset(self):
         self.timestep: int = 0
+        # Reset height command to default
+        self.height_command = self.commands_map[3][1]  # Default to middle value
+        # Reset arm positions to default
+        self.target_arm_pos = self.default_dof_pos[-self._n_demo_dof :].copy()
+        self.current_arm_pos = self.default_dof_pos[-self._n_demo_dof :].copy()
 
     def post_step_callback(self, commands=None):
         self.timestep += 1
@@ -98,14 +111,32 @@ class AMOPolicy(Policy):
                 lx, ly, rx, ry = axes["LeftX"], axes["LeftY"], axes["RightX"], axes["RightY"]
 
                 commands[0] = command_remap(ly, self.commands_map[0])
-                commands[1] = command_remap(rx, self.commands_map[1])
+                commands[1] = command_remap(rx, self.commands_map[1])  # ang_z (robot turning)
                 commands[2] = command_remap(lx, self.commands_map[2])
-                # commands[3] = command_remap(ry, self.commands_map[3]) # height
+                # Height control via Up/Down buttons
+                commands[3] = self.height_command
 
                 button_event = ctrl_data[key]["button_event"]
+                
+                # Process button events for height and arm control
                 for event in button_event:
-                    if event["type"] == "button" and event["name"] == "Y" and event["pressed"]:
-                        commands[7] = not commands[7]
+                    if event["type"] == "button" and event["pressed"]:
+                        if event["name"] == "Up":
+                            # Increase height (clamp to max)
+                            height_step = 0.05
+                            self.height_command = min(
+                                self.height_command + height_step,
+                                self.commands_map[3][2]  # max height
+                            )
+                            commands[3] = self.height_command
+                        elif event["name"] == "Down":
+                            # Decrease height (clamp to min)
+                            height_step = 0.05
+                            self.height_command = max(
+                                self.height_command - height_step,
+                                self.commands_map[3][0]  # min height
+                            )
+                            commands[3] = self.height_command
 
                 break
         return commands
@@ -117,6 +148,7 @@ class AMOPolicy(Policy):
         dof_vel = env_data.dof_vel
         base_quat = env_data.base_quat
         base_ang_vel = env_data.base_ang_vel
+        
 
         rpy = quatToEuler(base_quat)
 
@@ -140,10 +172,15 @@ class AMOPolicy(Policy):
 
         self.adapter_input = np.concatenate([np.zeros(4), dof_pos[15:]])
 
-        self.adapter_input[0] = self.cmd[3]  # + 0.75
-        self.adapter_input[1] = self.cmd[4]
-        self.adapter_input[2] = self.cmd[5]
-        self.adapter_input[3] = self.cmd[6]
+        # AMO adapter input format: [height, yaw, pitch, roll, arm_pos_0, ..., arm_pos_7]
+        # Based on AMO code: adapter_input[0] = 0.75 + commands[3] where commands[3] is offset
+        # Our cmd[3] is already the full height value (0.3-0.9), so use it directly
+        # The adapter expects absolute height, and our cmd[3] is already in the right range
+        self.adapter_input[0] = self.cmd[3]  # height (absolute, range 0.3-0.9)
+        # Torso controls removed - set to 0.0 (default)
+        self.adapter_input[1] = 0.0  # torso yaw (disabled)
+        self.adapter_input[2] = 0.0  # torso pitch (disabled)
+        self.adapter_input[3] = 0.0  # torso roll (disabled)
 
         self.adapter_input = torch.tensor(self.adapter_input).to(self.device, dtype=torch.float32).unsqueeze(0)
 
@@ -173,9 +210,10 @@ class AMOPolicy(Policy):
         obs_demo[: self._n_demo_dof] = dof_pos[15:]
         obs_demo[self._n_demo_dof] = self.cmd[0]
         obs_demo[self._n_demo_dof + 1] = self.cmd[2]
-        obs_demo[self._n_demo_dof + 3] = self.cmd[4]
-        obs_demo[self._n_demo_dof + 4] = self.cmd[5]
-        obs_demo[self._n_demo_dof + 5] = self.cmd[6]
+        # Torso controls removed - set to 0.0 (default)
+        obs_demo[self._n_demo_dof + 3] = 0.0  # torso yaw (disabled)
+        obs_demo[self._n_demo_dof + 4] = 0.0  # torso pitch (disabled)
+        obs_demo[self._n_demo_dof + 5] = 0.0  # torso roll (disabled)
         obs_demo[self._n_demo_dof + 6 : self._n_demo_dof + 9] = 0.75 + self.cmd[3]
 
         self.proprio_history_buf.append(obs_prop)

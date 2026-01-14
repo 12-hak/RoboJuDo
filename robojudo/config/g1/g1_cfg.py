@@ -1,3 +1,4 @@
+from .g1_loco_mimic_cfg import g1_locomimic_beyondmimic_real
 from robojudo.config import cfg_registry
 from robojudo.controller.ctrl_cfgs import (
     JoystickCtrlCfg,  # noqa: F401
@@ -75,6 +76,34 @@ class g1_real(g1):
     ctrl: list[UnitreeCtrlCfg] = [
         UnitreeCtrlCfg(),
     ]
+
+    do_safety_check: bool = True  # enable safety check for real robot
+
+
+@cfg_registry.register
+class g1_amo_real(RlPipelineCfg):
+    """
+    Unitree G1 robot, AMO Policy with height control, Sim2Real.
+    Use Up/Down buttons on remote to control height.
+    """
+
+    robot: str = "g1"
+    env: G1RealEnvCfg = G1RealEnvCfg(
+        env_type="UnitreeCppEnv",  # For unitree_cpp, check README for more details
+        unitree=G1UnitreeCfg(
+            net_if="eth0",  # note: change to your network interface
+        ),
+    )
+
+    ctrl: list[UnitreeCtrlCfg] = [
+        UnitreeCtrlCfg(
+            triggers_extra={
+                "F3": "[SHUTDOWN]",  # Emergency stop on F3 button
+            }
+        ),
+    ]
+
+    policy: G1AmoPolicyCfg = G1AmoPolicyCfg()
 
     do_safety_check: bool = True  # enable safety check for real robot
 
@@ -166,17 +195,21 @@ class g1_beyondmimic(RlPipelineCfg):
     """
 
     robot: str = "g1"
-    env: G1MujocoEnvCfg = G1MujocoEnvCfg()
+    env: G1MujocoEnvCfg = G1MujocoEnvCfg(
+        sim_decimation=40,  # Increased from 20 to 40 for faster simulation
+    )
     ctrl: list[KeyboardCtrlCfg] = [
         KeyboardCtrlCfg(),
     ]
 
+    run_fullspeed: bool = True  # Run at full speed for faster simulation
+
     policy: G1BeyondMimicPolicyCfg = G1BeyondMimicPolicyCfg(
-        policy_name="Jump_wose",
+        policy_name="Dance_wose",
         without_state_estimator=True,
         use_modelmeta_config=True,  # use robot dof config from modelmeta
         use_motion_from_model=True,  # use motion from onnx model
-        max_timestep=140,
+        max_timestep=-1,  # Use full motion length from model
     )
 
 

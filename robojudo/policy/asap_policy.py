@@ -131,12 +131,15 @@ class AsapPolicy(Policy):
         return obs, extras
 
     def get_action(self, obs: np.ndarray) -> np.ndarray:
+        # Use the actual input name from the ONNX model (supports both 'actor_obs' and 'obs')
+        input_name = self.input_names[0] if self.input_names else "actor_obs"
+        
         ort_inputs = {
-            "actor_obs": np.expand_dims(obs, axis=0).astype(np.float32),
+            input_name: np.expand_dims(obs, axis=0).astype(np.float32),
         }
 
         ort_outputs = self.session.run(
-            ["action"],
+            [self.output_names[0]],  # Use actual output name from model
             ort_inputs,
         )
         actions: np.ndarray = np.asarray(ort_outputs[0]).squeeze()
@@ -174,8 +177,13 @@ class AsapLocoPolicy(Policy):
         if not os.path.isfile(cfg_policy.policy_file):
             raise FileNotFoundError(f"Model file not found at {cfg_policy.policy_file}")
 
-        logger.debug(f"Loading mimic policy '{cfg_policy.policy_name}' from {cfg_policy.policy_file}")
-        self.session = ort.InferenceSession(cfg_policy.policy_file)
+        # Check if session was preloaded at script start (for faster loading)
+        if hasattr(cfg_policy, '_preloaded_session') and cfg_policy._preloaded_session is not None:
+            logger.info(f"Using preloaded session for '{cfg_policy.policy_name}' (fast loading)")
+            self.session = cfg_policy._preloaded_session
+        else:
+            logger.debug(f"Loading mimic policy '{cfg_policy.policy_name}' from {cfg_policy.policy_file}")
+            self.session = ort.InferenceSession(cfg_policy.policy_file)
 
         self.input_names = [i.name for i in self.session.get_inputs()]
         self.output_names = [o.name for o in self.session.get_outputs()]
@@ -205,7 +213,9 @@ class AsapLocoPolicy(Policy):
         self.ref_upper_dof_pos = self.ref_upper_dof_pos_default.copy()
         self.lin_vel_command = np.array([0.0, 0.0])
         self.ang_vel_command = np.array([0.0])
-        self.stand_command = np.array([0])
+        # Initialize stand_command to 1 for locomotion (enables movement by default)
+        # User can toggle with Left button if needed
+        self.stand_command = np.array([1])
         self.base_height_command = self.base_height_command_default.copy()
 
         self.last_action = np.zeros(self.num_actions)
@@ -294,12 +304,15 @@ class AsapLocoPolicy(Policy):
         return obs, extras
 
     def get_action(self, obs: np.ndarray) -> np.ndarray:
+        # Use the actual input name from the ONNX model (supports both 'actor_obs' and 'obs')
+        input_name = self.input_names[0] if self.input_names else "actor_obs"
+        
         ort_inputs = {
-            "actor_obs": np.expand_dims(obs, axis=0).astype(np.float32),
+            input_name: np.expand_dims(obs, axis=0).astype(np.float32),
         }
 
         ort_outputs = self.session.run(
-            ["action"],
+            [self.output_names[0]],  # Use actual output name from model
             ort_inputs,
         )
         actions: np.ndarray = np.asarray(ort_outputs[0]).squeeze()
@@ -324,17 +337,42 @@ class AsapLocoPolicy(Policy):
                 axes = ctrl_data[key]["axes"]
                 lx, ly, rx, _ry = axes["LeftX"], axes["LeftY"], axes["RightX"], axes["RightY"]
 
-                self.lin_vel_command[1] = command_remap(lx, [0.5, 0, -0.5]) * self.stand_command[0]
-                self.lin_vel_command[0] = command_remap(ly, [-0.5, 0, 0.5]) * self.stand_command[0]
-                self.ang_vel_command[0] = command_remap(rx, [1, 0, -1]) * self.stand_command[0]
+                # Get raw velocity commands (before stand_command multiplication)
+                # Increased limits for much faster walking:
+                # Forward/backward: ±1.5 (60% of ±2.5 for reduced forward speed)
+                # Left/right: ±1.0 (was ±0.5, AMO uses ±0.8)
+                # Turning: ±3.0 (half of ±6.0 for reduced turning speed)
+                raw_lin_vel_x = command_remap(ly, [-1.5, 0, 1.5])
+                raw_lin_vel_y = command_remap(lx, [1.0, 0, -1.0])
+                raw_ang_vel = command_remap(rx, [3.0, 0, -3.0])
+                
+                # Automatically set stand_command based on movement commands
+                # If all velocity commands are near zero, set stand_command to 0 (stand still)
+                # Otherwise, set to 1 (enable movement/gait)
+                vel_magnitude = np.sqrt(raw_lin_vel_x**2 + raw_lin_vel_y**2 + raw_ang_vel**2)
+                movement_threshold = 0.05  # Small threshold to avoid noise
+                
+                if vel_magnitude < movement_threshold:
+                    # No movement - stand still (stop phase time advancement)
+                    self.stand_command = np.array([0])
+                    self.lin_vel_command[0] = 0.0
+                    self.lin_vel_command[1] = 0.0
+                    self.ang_vel_command[0] = 0.0
+                else:
+                    # Movement detected - enable gait (advance phase time)
+                    self.stand_command = np.array([1])
+                    self.lin_vel_command[1] = raw_lin_vel_y
+                    self.lin_vel_command[0] = raw_lin_vel_x
+                    self.ang_vel_command[0] = raw_ang_vel
 
                 button_event = ctrl_data[key]["button_event"]
                 for event in button_event:
                     if event["type"] == "button" and event["pressed"]:
                         match event["name"]:
                             case "Left":
+                                # Toggle stand_command manually (override auto behavior)
                                 self.stand_command = 1 - self.stand_command
-                                if self.stand_command == 0:
+                                if self.stand_command[0] == 0:
                                     self.ang_vel_command[0] = 0.0
                                     self.lin_vel_command[0] = 0.0
                                     self.lin_vel_command[1] = 0.0

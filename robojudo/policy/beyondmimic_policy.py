@@ -20,6 +20,16 @@ class BeyondMimicPolicy(Policy):
 
     def __init__(self, cfg_policy: BeyondMimicPolicyCfg, device):
         # init onnx, override dof cfg if needed
+        import os
+        
+        # Check if file exists before trying to load
+        if not os.path.isfile(cfg_policy.policy_file):
+            raise FileNotFoundError(
+                f"BeyondMimic policy file not found: {cfg_policy.policy_file}\n"
+                f"Policy name: {cfg_policy.policy_name}\n"
+                f"Expected path: assets/models/{cfg_policy.robot}/beyondmimic/{cfg_policy.policy_name}.onnx"
+            )
+        
         sess_options = ort.SessionOptions()
 
         device = "cpu"
@@ -37,7 +47,15 @@ class BeyondMimicPolicy(Policy):
         else:
             raise ValueError(f"Unknown device: {device}")
 
-        self.session = ort.InferenceSession(cfg_policy.policy_file, sess_options, providers=providers)
+        logger.info(f"Loading BeyondMimic policy '{cfg_policy.policy_name}' from {cfg_policy.policy_file}")
+        try:
+            self.session = ort.InferenceSession(cfg_policy.policy_file, sess_options, providers=providers)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load ONNX model for policy '{cfg_policy.policy_name}': {e}\n"
+                f"File path: {cfg_policy.policy_file}\n"
+                f"The ONNX file may be corrupted or invalid. Please verify the file is a valid ONNX model."
+            ) from e
 
         self.input_names = [i.name for i in self.session.get_inputs()]
         self.output_names = [o.name for o in self.session.get_outputs()]

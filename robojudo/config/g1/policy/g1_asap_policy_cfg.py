@@ -237,8 +237,8 @@ class G1AsapPolicyCfg(AsapPolicyCfg):
 class G1AsapLocoPolicyCfg(AsapLocoPolicyCfg):
     robot: str = "g1"
 
-    policy_name: str = "20250109_231507-noDR_rand_history_loco_stand_height_noise-decoupled_locomotion-g1_29dof"
-    relative_path: str = "model_6600.onnx"
+    policy_name: str = "my_mjlab_loco"
+    relative_path: str = "g1_velocity.onnx"
 
     obs_dof: DoFConfig = G1_29AsapDoF()
     action_dof: DoFConfig = G1_12AsapDoF()
@@ -264,24 +264,26 @@ class G1AsapLocoPolicyCfg(AsapLocoPolicyCfg):
     )
     NUM_UPPER_BODY_JOINTS: int = 17
 
-    history_length: int = 4  # from history_mimic_config
-    history_obs_dims: dict[str, int] = {  # from obs_mimic_dims
-        "actions": obs_dof.num_dofs - NUM_UPPER_BODY_JOINTS,  # lower body actions
-        "base_ang_vel": 3,
-        "command_ang_vel": 1,
-        "command_base_height": 1,
-        "command_lin_vel": 2,
-        "command_stand": 1,
-        "cos_phase": 1,
-        "dof_pos": obs_dof.num_dofs,
-        "dof_vel": obs_dof.num_dofs,
-        # "phase_time": 1,
-        "projected_gravity": 3,
-        "ref_upper_dof_pos": NUM_UPPER_BODY_JOINTS,  # upper body actions
-        "sin_phase": 1,
-    }
+    # MJLAB model expects 99 observations (no history)
+    # Observation breakdown:
+    # - actions (lower body): 12
+    # - base_ang_vel: 3
+    # - command_ang_vel: 1
+    # - command_base_height: 1
+    # - command_lin_vel: 2
+    # - command_stand: 1
+    # - cos_phase: 1
+    # - dof_pos: 29
+    # - dof_vel: 29
+    # - projected_gravity: 3
+    # - ref_upper_dof_pos: 17
+    # - sin_phase: 1
+    # Total: 12+3+1+1+2+1+1+29+29+3+17+1 = 100 (close to 99, might need adjustment)
+    
+    history_length: int = 0  # NO HISTORY for mjlab model
+    history_obs_dims: dict[str, int] = {}  # Empty - no history
 
-    USE_HISTORY: bool = True
+    USE_HISTORY: bool = False  # Disable history for mjlab model
     GAIT_PERIOD: float = 0.8  # 1.25
 
     # ======= Default Command CONFIGURATION =======

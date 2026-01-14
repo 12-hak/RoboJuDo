@@ -21,9 +21,10 @@ class G1RealEnvCfg(G1EnvCfg, UnitreeEnvCfg):
     # ====== ENV CONFIGURATION ======
     unitree: UnitreeEnvCfg.UnitreeCfg = G1UnitreeCfg(
         net_if="eth0",
+        delay_mode_release=True,  # Keep robot in sport mode (R2+A) until prepare completes
     )
 
-    odometry_type: Literal["NONE", "DUMMY", "UNITREE", "ZED"] = "UNITREE"
+    odometry_type: Literal["NONE", "DUMMY", "UNITREE", "ZED", "SHM"] = "SHM"
 
     joint2motor_idx: list[int] | None = None  # list(range(0, 29))
 

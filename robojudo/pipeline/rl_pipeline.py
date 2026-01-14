@@ -49,9 +49,46 @@ class PolicyWrapper:
         return self.actions_adapter.fit(action)
 
     def get_pd_target(self, obs):
-        action = self.policy.get_action(obs)
-        pd_target = action + self.policy.default_pos
-        return self.actions_adapter.fit(pd_target, template=self.env_dof_cfg.default_pos)
+        # Check if policy has its own get_pd_target implementation (e.g., AMO policy with arm control)
+        if hasattr(self.policy, 'get_pd_target') and callable(getattr(self.policy, 'get_pd_target', None)):
+            # Policy has custom get_pd_target, use it directly (it handles full DOF including arms)
+            pd_target = self.policy.get_pd_target(obs)
+            # Policy's get_pd_target returns in obs_dof space, need to adapt to env_dof
+            # Use reverse of obs_adapter (obs_dof -> env_dof)
+            from robojudo.tools.dof import DoFAdapter
+            obs_to_env_adapter = DoFAdapter(self.policy.cfg_obs_dof.joint_names, self.env_dof_cfg.joint_names)
+            pd_target_env = obs_to_env_adapter.fit(pd_target, template=self.env_dof_cfg.default_pos)
+            
+            # Debug logging to verify arm positions are preserved after adaptation
+            if hasattr(self.policy, '_n_demo_dof') and self.policy.timestep % 50 == 0:
+                import logging
+                logger = logging.getLogger(__name__)
+                # Find arm joint indices in both spaces
+                obs_arm_joints = self.policy.cfg_obs_dof.joint_names[-self.policy._n_demo_dof:]
+                env_arm_joints = [name for name in obs_arm_joints if name in self.env_dof_cfg.joint_names]
+                if env_arm_joints:
+                    obs_arm_indices = [self.policy.cfg_obs_dof.joint_names.index(name) for name in obs_arm_joints]
+                    env_arm_indices = [self.env_dof_cfg.joint_names.index(name) for name in env_arm_joints]
+                    logger.info(f"PolicyWrapper: obs_arm_joints={obs_arm_joints[:4]}, "
+                               f"obs_pd_target[arm]={pd_target[obs_arm_indices[:4]]}, "
+                               f"env_arm_joints={env_arm_joints[:4]}, "
+                               f"env_pd_target[arm]={pd_target_env[env_arm_indices[:4]]}")
+            
+            return pd_target_env
+        else:
+            # Standard implementation: action + default_pos
+            action = self.policy.get_action(obs)
+            
+            # --- G1 STABILITY PATCH ---
+            # Flip Hip Roll to fix leg spreading
+            # Indices: 0-5 Left, 6-11 Right
+            if action.shape[-1] >= 12: 
+                 action[..., 1] *= -1.0 # Left Hip Roll
+                 action[..., 7] *= -1.0 # Right Hip Roll
+            # ---------------------------
+
+            pd_target = action + self.policy.default_pos
+            return self.actions_adapter.fit(pd_target, template=self.env_dof_cfg.default_pos)
 
     def get_init_dof_pos(self):
         return self.actions_adapter.fit(self.policy.get_init_dof_pos(), template=self.env_dof_cfg.default_pos)
@@ -107,7 +144,8 @@ class RlPipeline(Pipeline):
             return
         gravity_ori = get_gravity_orientation(self.env.base_quat)
         angle = np.arccos(np.clip(-gravity_ori[2], -1.0, 1.0))
-        if abs(angle) > 1.0:  # more than ~57 degrees
+        # Increase tolerance for active motions like running (from 1.0 to 1.3 rad / ~75 deg)
+        if abs(angle) > 1.3:  
             logger.error("Robot fallen! Shutdown for safety.")
             if hasattr(self.env, "reborn"):
                 self.env.reborn()  # pyright: ignore[reportAttributeAccessIssue]
@@ -126,6 +164,10 @@ class RlPipeline(Pipeline):
                     if hasattr(self.env, "reborn"):
                         logger.warning("Simulation Env reborn!")
                         self.env.reborn()  # pyright: ignore[reportAttributeAccessIssue]
+                case "[RETURN_TO_SPORT]":
+                    if hasattr(self.env, "select_sport_mode"):
+                        logger.warning("Returning to sport mode!")
+                        self.env.select_sport_mode()
 
         self.ctrl_manager.post_step_callback(ctrl_data)
 
@@ -157,6 +199,15 @@ class RlPipeline(Pipeline):
         pd_target = self.policy.get_pd_target(obs)
 
         if not dry_run:
+            # RAMP UP ACTION SCALE (Smooth Start)
+            target_scale = getattr(self.policy, 'target_action_scale', self.policy.action_scale) 
+            if not hasattr(self.policy, 'target_action_scale'):
+                 self.policy.target_action_scale = self.policy.action_scale
+            
+            # Ramp over first 100 steps
+            ramp_factor = min(self.timestep / 100.0, 1.0)
+            self.policy.action_scale = target_scale * ramp_factor
+
             self.env.step(pd_target, extras.get("hand_pose", None))
 
         self.post_step_callback(env_data, ctrl_data, extras, pd_target)
@@ -171,21 +222,32 @@ class RlPipeline(Pipeline):
         current_motor_angle = np.array(self.env.dof_pos)
         # logger.info(f"{current_motor_angle=}")
 
+        # Check if we're in prepare mode (sport mode active, don't send commands)
+        in_prepare_mode = hasattr(self.env, "_in_prepare_mode") and self.env._in_prepare_mode
+        
         traj_len = 1000
         last_step_time = time.time()
         logger.warning("prepare_init")
+        if in_prepare_mode:
+            logger.info("Robot in sport mode - letting sport mode handle robot during prepare")
         pbar = ProgressBar("Prepare", traj_len)
 
         for t in range(traj_len):
             current_motor_angle = np.array(self.env.dof_pos)
-
+            
+            # Standard blend (300 steps = 0.6s)
             blend_ratio = np.minimum(t / 300, 1)
             action = (1 - blend_ratio) * current_motor_angle + blend_ratio * desired_motor_angle
 
             # warm up network
             self.step(dry_run=True)
 
-            self.env.step(action)
+            # Only send commands if not in prepare mode (sport mode will handle it)
+            if not in_prepare_mode:
+                self.env.step(action)
+            else:
+                # Just update state, let sport mode control the robot
+                self.env.update()
 
             time_diff = last_step_time + self.dt - time.time()
             if time_diff > 0:

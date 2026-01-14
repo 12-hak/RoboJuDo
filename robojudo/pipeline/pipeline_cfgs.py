@@ -24,6 +24,12 @@ class PipelineCfg(Config):
     If True, perform safety check after each step.
     We recommend enabling this, however if motion is very aggressive, you may disable it.
     """
+    
+    stand_at_end: bool = False
+    """
+    If True, when the script exits or a SHUTDOWN command is received, 
+    the robot will transition back to sport mode and stand up safely.
+    """
 
 
 class RlPipelineCfg(PipelineCfg):
@@ -70,6 +76,12 @@ class RlLocoMimicPipelineCfg(PipelineCfg):
     """Default positions of the upper body DOFs"""
     upper_dof_override_indices: list[int] | None = []
     """Indices of the upper body DOFs to be overridden"""
+
+    # ===== Interpolation Config =====
+    durations_loco_mimic: list[int] | None = None
+    """Interpolation durations for loco->mimic transition: [start, in-progress, end] in steps. Default: [0, 75, 25]"""
+    durations_mimic_loco: list[int] | None = None
+    """Interpolation durations for mimic->loco transition: [start, in-progress, end] in steps. Default: [25, 75, 0]"""
 
     @model_validator(mode="after")
     def check_upper_dof(self):

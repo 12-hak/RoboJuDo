@@ -78,6 +78,9 @@ class UnitreeEnvCfg(RobotEnvCfg):
 
         control_dt: float = 0.02
         """control command dt"""
+        
+        delay_mode_release: bool = False
+        """If True, don't release sport mode during init. Call release_mode() manually after prepare."""
 
     env_type: str = "UnitreeEnv"  # For unitree_sdk2py
     # env_type: str = "UnitreeCppEnv" # For unitree_cpp
@@ -85,7 +88,7 @@ class UnitreeEnvCfg(RobotEnvCfg):
 
     unitree: UnitreeCfg
 
-    odometry_type: Literal["NONE", "DUMMY", "UNITREE", "ZED"] = "DUMMY"  # pyright: ignore[reportIncompatibleVariableOverride]
+    odometry_type: Literal["NONE", "DUMMY", "UNITREE", "ZED", "SHM"] = "DUMMY"  # pyright: ignore[reportIncompatibleVariableOverride]
 
     joint2motor_idx: list[int] | None = None
     """Mapping from env dof to motor index, None for direct mapping"""

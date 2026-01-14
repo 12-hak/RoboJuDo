@@ -161,31 +161,57 @@ class PolicyInterpManager(PolicyManager):
         logger.info(f"Switch mimic policy to {self.policy_mimic_idx}: {policy_name}")
 
     def switch_to_loco(self):
-        if self.current_policy_id == self.policy_loco_id:
+        if self.current_policy_id == self.policy_loco_id and self.interp_state == self.InterpState.IDLE:
             logger.warning("Already in locomotion policy.")
             return
-        self.policy_by_id(self.policy_loco_id).reset()
-        self.warmup_policy_indices.add(self.policy_loco_id)
-        # Instant switch - no interpolation
-        self.set_policy(self.policy_loco_id)
+        source_policy_id = self.current_policy_id
+        if self.current_policy_id != self.policy_loco_id:
+            self.policy_by_id(self.policy_loco_id).reset()
+            self.warmup_policy_indices.add(self.policy_loco_id)
+        self._interpolate_init(
+            get_target_pos=lambda: self.loco_dof_pos,
+            durations=self.durations_mimic_loco,
+            callback_start=lambda: self.set_policy(self.policy_loco_id),
+            source_policy_id=source_policy_id,
+            target_policy_id=self.policy_loco_id,
+            blend_actions=True,
+        )
 
     def switch_to_mimic(self):
         if self.current_policy_id != self.policy_loco_id:
             logger.warning("Already in mimic policy.")
             return
         policy_mimic_id = self.policy_mimic_ids[self.policy_mimic_idx]
+        source_policy_id = self.current_policy_id
         self.policy_by_id(policy_mimic_id).reset()
         self.warmup_policy_indices.add(policy_mimic_id)
-        # Instant switch - no interpolation
-        self.set_policy(policy_mimic_id)
+        self._interpolate_init(
+            get_target_pos=lambda: self.policy_by_id(policy_mimic_id).get_init_dof_pos(),
+            durations=self.durations_loco_mimic,
+            # Switch policy at START of interpolation so mimic policy takes over during transition
+            callback_start=lambda: self.set_policy(policy_mimic_id),
+            callback_end=None,  # No callback at end - policy already switched
+            source_policy_id=source_policy_id,
+            target_policy_id=policy_mimic_id,
+            blend_actions=True,
+        )
 
     def step(self, env_data, ctrl_data):
         super().step(env_data, ctrl_data)
-        # Interpolation removed - instant policy switching
+        self._interpolate_step()
 
 
 @pipeline_registry.register
-class RlLocoMimicPipeline(RlMultiPolicyPipeline):
+class RlLocoMimicPipelineFast(RlMultiPolicyPipeline):
+    """
+    Optimized version of RlLocoMimicPipeline with faster policy loading.
+    
+    Optimizations:
+    - ONNX Runtime optimizations (graph optimization, memory patterns)
+    - Always preloads policy (not just when delay_mode_release is True)
+    - Optimized TorchScript loading
+    - Cached session reuse (if applicable)
+    """
     cfg: RlLocoMimicPipelineCfg
 
     @property
@@ -196,28 +222,51 @@ class RlLocoMimicPipeline(RlMultiPolicyPipeline):
         # Skip RlMultiPolicyPipeline initialization
         Pipeline.__init__(self, cfg=cfg)
 
-        # Preload locomotion policy BEFORE initializing environment to avoid mode switching during policy load
-        if not cfg.env.is_sim and hasattr(cfg.env, 'unitree') and cfg.env.unitree.delay_mode_release:
-            logger.info("Preloading locomotion policy before environment initialization...")
+        # Check if policy was preloaded at script start (from run_pipeline.py)
+        # If not, load it now with optimizations
+        preloaded_session = getattr(cfg.loco_policy, '_preloaded_session', None)
+        
+        if preloaded_session is None and not cfg.env.is_sim:
+            # Fallback: Load here if not preloaded earlier
+            logger.info("Preloading locomotion policy with optimizations (fallback)...")
             if not cfg.loco_policy.disable_autoload:
                 loco_policy_file = cfg.loco_policy.policy_file
                 loco_policy_type = cfg.loco_policy.policy_type
                 logger.info(f"Preloading {loco_policy_type} from {loco_policy_file}...")
                 try:
-                    # Handle different policy file formats
+                    # Handle different policy file formats with optimizations
                     if loco_policy_file.endswith('.onnx'):
                         import onnxruntime as ort
                         sess_options = ort.SessionOptions()
+                        
+                        # OPTIMIZATION: Enable graph optimizations for faster loading and inference
+                        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                        
+                        # OPTIMIZATION: Enable memory optimizations for faster startup
+                        sess_options.enable_mem_pattern = True
+                        sess_options.enable_cpu_mem_arena = True
+                        
+                        # OPTIMIZATION: Use fewer threads for faster initialization
+                        sess_options.intra_op_num_threads = 2
+                        sess_options.inter_op_num_threads = 2
+                        
                         providers = ["CPUExecutionProvider"]
-                        _ = ort.InferenceSession(loco_policy_file, sess_options, providers=providers)
-                        logger.info("✓ Locomotion policy (ONNX) preloaded successfully")
+                        preloaded_session = ort.InferenceSession(loco_policy_file, sess_options, providers=providers)
+                        logger.info("✓ Locomotion policy (ONNX) preloaded with optimizations")
                     else:
                         # Assume TorchScript (.pt file)
                         import torch
-                        _ = torch.jit.load(loco_policy_file, map_location=self.device)
-                        logger.info("✓ Locomotion policy (TorchScript) preloaded successfully")
+                        model = torch.jit.load(loco_policy_file, map_location=self.device)
+                        model.eval()
+                        preloaded_session = model
+                        logger.info("✓ Locomotion policy (TorchScript) preloaded with optimizations")
                 except Exception as e:
                     logger.warning(f"Failed to preload locomotion policy: {e}")
+        elif preloaded_session is not None:
+            logger.info("✓ Using preloaded locomotion policy from script start")
+        
+        # Store preloaded session for potential reuse (if policy classes support it)
+        self._preloaded_loco_session = preloaded_session
 
         env_class: type[Environment] = getattr(robojudo.environment, self.cfg.env.env_type)
         self.env: Environment = env_class(cfg_env=self.cfg.env, device=self.device)
@@ -281,10 +330,7 @@ class RlLocoMimicPipeline(RlMultiPolicyPipeline):
             match command:
                 case "[SHUTDOWN]":
                     logger.warning("Emergency shutdown!")
-                    if getattr(self.cfg, 'stand_at_end', False) and hasattr(self.env, 'return_to_standing'):
-                        self.env.return_to_standing()
-                    else:
-                        self.env.shutdown()
+                    self.env.shutdown()
                 case "[SIM_REBORN]":
                     if hasattr(self.env, "reborn"):
                         logger.warning("Simulation Env reborn!")
@@ -334,16 +380,83 @@ class RlLocoMimicPipeline(RlMultiPolicyPipeline):
         if len(commands) > 0:
             logger.info(f"{'=' * 10} COMMANDS {'=' * 10}\n{commands}")
 
-        # Normal operation - single policy, no interpolation
-        if self.policy_manager.current_policy_id == self.policy_manager.policy_loco_id:
-            ctrl_data["ref_dof_pos"] = self.policy.obs_adapter.fit(self.policy_manager.override_dof_pos)
+        # Check if we're blending actions during interpolation
+        if self.policy_manager.is_blending_actions():
+            # Get interpolation alpha (0.0 = source policy, 1.0 = target policy)
+            alpha = self.policy_manager.get_interpolation_alpha()
+            source_policy_id = self.policy_manager.interp_source_policy_id
+            target_policy_id = self.policy_manager.interp_target_policy_id
+            
+            # Safety check: ensure both policy IDs are valid
+            if source_policy_id is None or target_policy_id is None:
+                # Fall back to normal operation if policy IDs are not set
+                if self.policy_manager.current_policy_id == self.policy_manager.policy_loco_id:
+                    ctrl_data["ref_dof_pos"] = self.policy.obs_adapter.fit(self.policy_manager.override_dof_pos)
+                obs, extras = self.policy.get_observation(env_data, ctrl_data)
+                pd_target = self.policy.get_pd_target(obs)
+                if self.policy_manager.current_policy_id == self.policy_manager.policy_loco_id:
+                    pd_target[self.override_dof_indices] = self.policy_manager.override_dof_pos[self.override_dof_indices]
+            else:
+                # Get observations and pd_targets from both policies
+                source_policy = self.policy_manager.policy_by_id(source_policy_id)
+                target_policy = self.policy_manager.policy_by_id(target_policy_id)
+                
+                # Prepare ctrl_data for both policies
+                if source_policy_id == self.policy_manager.policy_loco_id:
+                    ctrl_data_source = ctrl_data.copy()
+                    ctrl_data_source["ref_dof_pos"] = source_policy.obs_adapter.fit(self.policy_manager.override_dof_pos)
+                else:
+                    ctrl_data_source = ctrl_data
+                
+                if target_policy_id == self.policy_manager.policy_loco_id:
+                    ctrl_data_target = ctrl_data.copy()
+                    ctrl_data_target["ref_dof_pos"] = target_policy.obs_adapter.fit(self.policy_manager.override_dof_pos)
+                else:
+                    ctrl_data_target = ctrl_data
+                
+                # Get observations and pd_targets from both policies
+                obs_source, extras_source = source_policy.get_observation(env_data, ctrl_data_source)
+                obs_target, extras_target = target_policy.get_observation(env_data, ctrl_data_target)
+                
+                pd_target_source = source_policy.get_pd_target(obs_source)
+                pd_target_target = target_policy.get_pd_target(obs_target)
+                
+                # Blend the pd_targets
+                pd_target = (1 - alpha) * pd_target_source + alpha * pd_target_target
+                
+                # Handle override_dof_pos for locomotion policy if needed
+                if source_policy_id == self.policy_manager.policy_loco_id:
+                    pd_target[self.override_dof_indices] = (1 - alpha) * self.policy_manager.override_dof_pos[self.override_dof_indices] + alpha * pd_target_target[self.override_dof_indices]
+                elif target_policy_id == self.policy_manager.policy_loco_id:
+                    pd_target[self.override_dof_indices] = (1 - alpha) * pd_target_source[self.override_dof_indices] + alpha * self.policy_manager.override_dof_pos[self.override_dof_indices]
+                
+                # Merge extras (prefer target policy extras)
+                extras = extras_target.copy()
+                extras.update(extras_source)
+        else:
+            # Normal operation - single policy
+            if self.policy_manager.current_policy_id == self.policy_manager.policy_loco_id:
+                ctrl_data["ref_dof_pos"] = self.policy.obs_adapter.fit(self.policy_manager.override_dof_pos)
 
-        obs, extras = self.policy.get_observation(env_data, ctrl_data)
+            obs, extras = self.policy.get_observation(env_data, ctrl_data)
 
-        pd_target = self.policy.get_pd_target(obs)
+            pd_target = self.policy.get_pd_target(obs)
 
-        if self.policy_manager.current_policy_id == self.policy_manager.policy_loco_id:
-            pd_target[self.override_dof_indices] = self.policy_manager.override_dof_pos[self.override_dof_indices]
+            if self.policy_manager.current_policy_id == self.policy_manager.policy_loco_id:
+                pd_target[self.override_dof_indices] = self.policy_manager.override_dof_pos[self.override_dof_indices]
+            elif self.policy_manager.interp_state == self.policy_manager.InterpState.IN_PROGRESS:
+                # We're in mimic policy and interpolation is active
+                # Blend interpolated upper body positions with mimic policy output for smooth transition
+                interp_alpha = self.policy_manager.get_interpolation_alpha()
+                # Get mimic policy's desired upper body positions
+                policy_upper = pd_target[self.override_dof_indices].copy()
+                # Get interpolated upper body positions (from locomotion to mimic start)
+                interp_upper = self.policy_manager.override_dof_pos[self.override_dof_indices]
+                # Blend: start with interpolation (smooth from locomotion), gradually move to full mimic policy control
+                # When alpha=0: use interpolation (smooth transition from locomotion)
+                # When alpha=1: use full mimic policy (interpolation complete)
+                blended_upper = (1 - interp_alpha) * interp_upper + interp_alpha * policy_upper
+                pd_target[self.override_dof_indices] = blended_upper
 
         if not dry_run:
             self.env.step(pd_target, extras.get("hand_pose", None))
@@ -426,3 +539,4 @@ class RlLocoMimicPipeline(RlMultiPolicyPipeline):
 
 if __name__ == "__main__":
     pass
+

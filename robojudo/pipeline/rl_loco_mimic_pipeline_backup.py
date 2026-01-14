@@ -58,9 +58,6 @@ class PolicyInterpManager(PolicyManager):
         self.interp_pbar = None
         self.interp_callback_start = None
         self.interp_callback_end = None
-        self.interp_source_policy_id = None  # Policy we're transitioning from
-        self.interp_target_policy_id = None  # Policy we're transitioning to
-        self.interp_blend_actions = False  # Whether to blend actions during interpolation
 
         self.loco_dof_pos = loco_dof_pos if loco_dof_pos is not None else self.env.default_pos.copy()
         self.override_dof_pos = self.loco_dof_pos.copy()
@@ -71,17 +68,11 @@ class PolicyInterpManager(PolicyManager):
         durations: list[int],
         callback_start=None,
         callback_end=None,
-        source_policy_id: int | None = None,
-        target_policy_id: int | None = None,
-        blend_actions: bool = True,
     ):
         self.interp_get_target_pos = get_target_pos
         self.interp_durations = durations
         self.interp_callback_start = callback_start
         self.interp_callback_end = callback_end
-        self.interp_source_policy_id = source_policy_id
-        self.interp_target_policy_id = target_policy_id
-        self.interp_blend_actions = blend_actions
         self.interp_pbar = ProgressBar("Interpolation", durations[1])
 
         self.interp_state = self.InterpState.START
@@ -115,10 +106,6 @@ class PolicyInterpManager(PolicyManager):
             self.interp_callback_end()
             self.interp_callback_end = None
         self.interp_state = self.InterpState.IDLE
-        # Clear interpolation policy IDs when done
-        self.interp_source_policy_id = None
-        self.interp_target_policy_id = None
-        self.interp_blend_actions = False
 
         # logger.debug("Interpolation ended.")
 
@@ -137,17 +124,6 @@ class PolicyInterpManager(PolicyManager):
             self.interp_timestep += 1
         else:
             self.interp_state = self.InterpState.END
-    
-    def get_interpolation_alpha(self) -> float:
-        """Get the current interpolation alpha (0.0 = source, 1.0 = target)."""
-        if self.interp_state != self.InterpState.IN_PROGRESS:
-            return 1.0 if self.interp_state == self.InterpState.END else 0.0
-        progress = self.interp_timestep / self.interp_durations[1]
-        return min(progress, 1.0)
-    
-    def is_blending_actions(self) -> bool:
-        """Check if we're currently blending actions during interpolation."""
-        return self.interp_blend_actions and self.interp_state == self.InterpState.IN_PROGRESS
 
     def toggle_mimic_policy(self, delta: int):
         # only switch mimic policy if current policy is locomotion
@@ -161,13 +137,17 @@ class PolicyInterpManager(PolicyManager):
         logger.info(f"Switch mimic policy to {self.policy_mimic_idx}: {policy_name}")
 
     def switch_to_loco(self):
-        if self.current_policy_id == self.policy_loco_id:
+        if self.current_policy_id == self.policy_loco_id and self.interp_state == self.InterpState.IDLE:
             logger.warning("Already in locomotion policy.")
             return
-        self.policy_by_id(self.policy_loco_id).reset()
-        self.warmup_policy_indices.add(self.policy_loco_id)
-        # Instant switch - no interpolation
-        self.set_policy(self.policy_loco_id)
+        if self.current_policy_id != self.policy_loco_id:
+            self.policy_by_id(self.policy_loco_id).reset()
+            self.warmup_policy_indices.add(self.policy_loco_id)
+        self._interpolate_init(
+            get_target_pos=lambda: self.loco_dof_pos,
+            durations=self.durations_mimic_loco,
+            callback_start=lambda: self.set_policy(self.policy_loco_id),
+        )
 
     def switch_to_mimic(self):
         if self.current_policy_id != self.policy_loco_id:
@@ -176,12 +156,15 @@ class PolicyInterpManager(PolicyManager):
         policy_mimic_id = self.policy_mimic_ids[self.policy_mimic_idx]
         self.policy_by_id(policy_mimic_id).reset()
         self.warmup_policy_indices.add(policy_mimic_id)
-        # Instant switch - no interpolation
-        self.set_policy(policy_mimic_id)
+        self._interpolate_init(
+            get_target_pos=lambda: self.policy_by_id(policy_mimic_id).get_init_dof_pos(),
+            durations=self.durations_loco_mimic,
+            callback_end=lambda: self.set_policy(policy_mimic_id),
+        )
 
     def step(self, env_data, ctrl_data):
         super().step(env_data, ctrl_data)
-        # Interpolation removed - instant policy switching
+        self._interpolate_step()
 
 
 @pipeline_registry.register
@@ -281,10 +264,7 @@ class RlLocoMimicPipeline(RlMultiPolicyPipeline):
             match command:
                 case "[SHUTDOWN]":
                     logger.warning("Emergency shutdown!")
-                    if getattr(self.cfg, 'stand_at_end', False) and hasattr(self.env, 'return_to_standing'):
-                        self.env.return_to_standing()
-                    else:
-                        self.env.shutdown()
+                    self.env.shutdown()
                 case "[SIM_REBORN]":
                     if hasattr(self.env, "reborn"):
                         logger.warning("Simulation Env reborn!")
@@ -334,7 +314,6 @@ class RlLocoMimicPipeline(RlMultiPolicyPipeline):
         if len(commands) > 0:
             logger.info(f"{'=' * 10} COMMANDS {'=' * 10}\n{commands}")
 
-        # Normal operation - single policy, no interpolation
         if self.policy_manager.current_policy_id == self.policy_manager.policy_loco_id:
             ctrl_data["ref_dof_pos"] = self.policy.obs_adapter.fit(self.policy_manager.override_dof_pos)
 
@@ -383,14 +362,7 @@ class RlLocoMimicPipeline(RlMultiPolicyPipeline):
             self.env.release_mode()
             t_release_end = time.time()
             logger.info(f"[DEBUG] env.release_mode() took {(t_release_end-t_release_start)*1000:.2f}ms")
-            logger.info("✓ Sport mode released - robot now in low-level control mode")
-            
-            # CRITICAL: Send a command with default positions IMMEDIATELY after release_mode()
-            # This prevents arms from raising during the transition gap (like when using L2_R2 buttons)
-            logger.info("[DEBUG] Sending immediate default position command to prevent arm raise...")
-            default_pos_cmd = self.env.default_pos.copy()
-            self.env.step(default_pos_cmd)
-            logger.info("[DEBUG] ✓ Default position command sent")
+            logger.info("✓ Sport mode released - locomotion policy now has full control")
             
             # IMMEDIATE COMMAND: Send first command with ZERO delay
             t_first_step = time.time()

@@ -26,16 +26,16 @@ class G1SmoothDoF(DoFConfig):
     ]
 
     default_pos: list[float] | None = [
-        *[-0.4, 0.0, 0.0, 0.8, -0.35, 0.0],
-        *[-0.4, 0.0, 0.0, 0.8, -0.35, 0.0],
+        *[-0.15, 0.0, 0.0, 0.35, -0.2, 0.0],  # More upright stance for stability (was: -0.4, 0.8, -0.35)
+        *[-0.15, 0.0, 0.0, 0.35, -0.2, 0.0],  # More upright stance for stability (was: -0.4, 0.8, -0.35)
         *[0],
         *[0, 0, 0, 0],
         *[0, 0, 0, 0],
     ]
 
     stiffness: list[float] | None = [
-        *[200, 150, 150, 200, 20, 20],
-        *[200, 150, 150, 200, 20, 20],
+        *[150, 150, 150, 300, 80, 20],  # Reduced hip/knee stiffness, increased ankle for stability (was: 200, 200, 20, 20)
+        *[150, 150, 150, 300, 80, 20],  # Reduced hip/knee stiffness, increased ankle for stability (was: 200, 200, 20, 20)
         *[200],
         *[40, 40, 40, 40],
         *[40, 40, 40, 40],
@@ -65,9 +65,13 @@ class G1SmoothPolicyCfg(SmoothPolicyCfg):
     obs_dof: DoFConfig = G1SmoothDoF()
     action_dof: DoFConfig = obs_dof
 
+    # Increased action smoothing for stability (default is 0.8, lower = more smoothing)
+    action_beta: float = 0.6  # More aggressive smoothing for stability
+
     cycle_time: float = 0.64
+    # Symmetric commands_map for better stability (was asymmetric)
     commands_map: list[list[float]] = [
-        [-1.5, -0.5, 0.5],
-        [0.25, 0.0, -0.25],
-        [0.5, -0.5, -1.5],
+        [-1.0, 0.0, 1.0],   # Forward/backward: symmetric range (was: [-1.5, -0.5, 0.5])
+        [-0.5, 0.0, 0.5],   # Left/right: symmetric range (was: [0.25, 0.0, -0.25])
+        [-1.0, 0.0, 1.0],   # Turning: symmetric range (was: [0.5, -0.5, -1.5])
     ]
